@@ -270,8 +270,13 @@ export async function onRequest(context) {
             }
 
             // 读取响应内容为文本
-            const content = await response.text();
             const contentType = response.headers.get('Content-Type') || '';
+            if (!isTextResponse(targetUrl, contentType)) {
+                logDebug(`Request succeeded: ${targetUrl}, Content-Type: ${contentType}, forwarding binary stream`);
+                return { content: null, body: response.body, contentType, responseHeaders: response.headers, status: response.status };
+            }
+
+            const content = await response.text();
             logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
             return { content, contentType, responseHeaders: response.headers }; // 同时返回原始响应头
 
@@ -290,6 +295,23 @@ export async function onRequest(context) {
         }
         // 检查内容本身是否以 #EXTM3U 开头
         return content && typeof content === 'string' && content.trim().startsWith('#EXTM3U');
+    }
+
+    function isTextResponse(targetUrl, contentType) {
+        const pathname = new URL(targetUrl).pathname.toLowerCase();
+        return pathname.endsWith('.m3u8') ||
+            /^text\//i.test(contentType) ||
+            /^application\/(json|[^;]+\+json|xml|[^;]+\+xml|javascript|x-www-form-urlencoded)/i.test(contentType) ||
+            /^(application\/vnd\.apple\.mpegurl|application\/x-mpegurl|audio\/mpegurl)/i.test(contentType);
+    }
+
+    function createMediaResponse(body, status, responseHeaders) {
+        const headers = new Headers();
+        ['content-type', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified'].forEach(name => {
+            const value = responseHeaders.get(name);
+            if (value) headers.set(name, value);
+        });
+        return createResponse(body, status, headers);
     }
 
     // 判断是否是媒体文件 (根据扩展名和 Content-Type) - 这部分在此代理中似乎未使用，但保留
@@ -456,7 +478,11 @@ export async function onRequest(context) {
         }
 
         logDebug(`选择的子列表 (带宽: ${highestBandwidth}): ${bestVariantUrl}`);
-        const { content: variantContent, contentType: variantContentType } = await fetchContentWithType(bestVariantUrl);
+        const { content: variantContent, body: variantBody, contentType: variantContentType, responseHeaders: variantHeaders, status: variantStatus } = await fetchContentWithType(bestVariantUrl);
+
+        if (variantContent === null) {
+            return createMediaResponse(variantBody, variantStatus, variantHeaders);
+        }
 
         if (!isM3u8Content(variantContent, variantContentType)) {
             logDebug(`获取到的子列表 ${bestVariantUrl} 不是 M3U8 内容 (类型: ${variantContentType})。可能直接是媒体文件，返回原始内容。`);
@@ -471,6 +497,8 @@ export async function onRequest(context) {
         }
 
         const processedVariant = await processM3u8Content(bestVariantUrl, variantContent, recursionDepth + 1, env);
+
+        if (processedVariant instanceof Response) return processedVariant;
 
         if (kvNamespace) {
              try {
@@ -521,9 +549,12 @@ export async function onRequest(context) {
                     try { headers = JSON.parse(cachedData.headers); } catch(e){} // 解析头部
                     const contentType = headers['content-type'] || headers['Content-Type'] || '';
 
-                    if (isM3u8Content(content, contentType)) {
+                    if (!isTextResponse(targetUrl, contentType)) {
+                        logDebug(`Skipping legacy text cache for binary response: ${targetUrl}`);
+                    } else if (isM3u8Content(content, contentType)) {
                         logDebug(`缓存内容是 M3U8，重新处理: ${targetUrl}`);
                         const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env);
+                        if (processedM3u8 instanceof Response) return processedM3u8;
                         return createM3u8Response(processedM3u8);
                     } else {
                         logDebug(`从缓存返回非 M3U8 内容: ${targetUrl}`);
@@ -539,7 +570,11 @@ export async function onRequest(context) {
         }
 
         // --- 实际请求 ---
-        const { content, contentType, responseHeaders } = await fetchContentWithType(targetUrl);
+        const { content, body, contentType, responseHeaders, status } = await fetchContentWithType(targetUrl);
+
+        if (content === null) {
+            return createMediaResponse(body, status, responseHeaders);
+        }
 
         // --- 写入缓存 (KV) ---
         if (kvNamespace) {
@@ -560,6 +595,7 @@ export async function onRequest(context) {
         if (isM3u8Content(content, contentType)) {
             logDebug(`内容是 M3U8，开始处理: ${targetUrl}`);
             const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env);
+            if (processedM3u8 instanceof Response) return processedM3u8;
             return createM3u8Response(processedM3u8);
         } else {
             logDebug(`内容不是 M3U8 (类型: ${contentType})，直接返回: ${targetUrl}`);
