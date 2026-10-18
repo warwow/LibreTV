@@ -5,6 +5,8 @@
  * 通过读取页面上嵌入的环境变量来检查
  */
 function isPasswordProtected() {
+    if (window.__ENV__?.PUBLIC_ACCESS === true) return false;
+
     // 只检查普通密码
     const pwd = window.__ENV__ && window.__ENV__.PASSWORD;
     
@@ -18,7 +20,7 @@ function isPasswordProtected() {
  * 为了安全考虑，所有部署都必须设置密码
  */
 function isPasswordRequired() {
-    return !isPasswordProtected();
+    return window.__ENV__?.PUBLIC_ACCESS !== true && !isPasswordProtected();
 }
 
 /**
@@ -67,6 +69,8 @@ async function verifyPassword(password) {
 
 // 验证状态检查
 function isPasswordVerified() {
+    if (window.__ENV__?.PUBLIC_ACCESS === true) return true;
+
     try {
         if (!isPasswordProtected()) return true;
 

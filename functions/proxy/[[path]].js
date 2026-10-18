@@ -7,7 +7,6 @@
 // FILTER_DISCONTINUITY (不再需要，设为 false 或移除)
 // USER_AGENTS_JSON (例如 ["UA1", "UA2"]) - JSON 字符串数组
 // DEBUG (例如 false 或 true)
-// PASSWORD (例如 "your_password") - 鉴权密码
 // --- 配置结束 ---
 
 // --- 常量 (之前在 config.js 中，现在移到这里，因为它们与代理逻辑相关) ---
@@ -17,6 +16,12 @@ const MEDIA_FILE_EXTENSIONS = [
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.svg', '.avif', '.heic'
 ];
 const MEDIA_CONTENT_TYPES = ['video/', 'audio/', 'image/'];
+const PROVIDER_API_HOSTS = new Set([
+    'jszyapi.com',
+    '360zy.com',
+    'cj.rycjapi.com'
+]);
+const DOUBAN_IMAGE_HOST = /^img\d+\.doubanio\.com$/i;
 // --- 常量结束 ---
 
 
@@ -28,22 +33,13 @@ export async function onRequest(context) {
     const { request, env, next, waitUntil } = context; // next 和 waitUntil 可能需要
     const url = new URL(request.url);
 
-    // 验证鉴权（主函数调用）
-    const isValidAuth = await validateAuth(request, env);
-    if (!isValidAuth) {
-        return new Response(JSON.stringify({
-            success: false,
-            error: '代理访问未授权：请检查密码配置或鉴权参数'
-        }), { 
-            status: 401,
-            headers: {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-                'Access-Control-Allow-Headers': '*',
-                'Content-Type': 'application/json'
-            }
+    if (request.method !== 'GET') {
+        return new Response('Method Not Allowed', {
+            status: 405,
+            headers: { 'Allow': 'GET' }
         });
     }
+    if (url.search) return new Response('Proxy query parameters are not supported', { status: 400 });
 
     // --- 从环境变量读取配置 ---
     const DEBUG_ENABLED = (env.DEBUG === 'true');
@@ -72,62 +68,6 @@ export async function onRequest(context) {
 
     // --- 辅助函数 ---
 
-    // 验证代理请求的鉴权
-    async function validateAuth(request, env) {
-        const url = new URL(request.url);
-        const authHash = url.searchParams.get('auth');
-        const timestamp = url.searchParams.get('t');
-        
-        // 获取服务器端密码
-        const serverPassword = env.PASSWORD;
-        if (!serverPassword) {
-            console.error('服务器未设置 PASSWORD 环境变量，代理访问被拒绝');
-            return false;
-        }
-        
-        // 使用 SHA-256 哈希算法（与其他平台保持一致）
-        // 在 Cloudflare Workers 中使用 crypto.subtle
-        try {
-            const encoder = new TextEncoder();
-            const data = encoder.encode(serverPassword);
-            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-            const hashArray = Array.from(new Uint8Array(hashBuffer));
-            const serverPasswordHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-            
-            if (!authHash || authHash !== serverPasswordHash) {
-                console.warn('代理请求鉴权失败：密码哈希不匹配');
-                return false;
-            }
-        } catch (error) {
-            console.error('计算密码哈希失败:', error);
-            return false;
-        }
-        
-        // 验证时间戳（10分钟有效期）
-        if (timestamp) {
-            const now = Date.now();
-            const maxAge = 10 * 60 * 1000; // 10分钟
-            if (now - parseInt(timestamp) > maxAge) {
-                console.warn('代理请求鉴权失败：时间戳过期');
-                return false;
-            }
-        }
-        
-        return true;
-    }
-
-    // 验证鉴权（主函数调用）
-    if (!validateAuth(request, env)) {
-        return new Response('Unauthorized', { 
-            status: 401,
-            headers: {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-                'Access-Control-Allow-Headers': '*'
-            }
-        });
-    }
-
     // 输出调试日志 (需要设置 DEBUG: true 环境变量)
     function logDebug(message) {
         if (DEBUG_ENABLED) {
@@ -139,47 +79,76 @@ export async function onRequest(context) {
     function getTargetUrlFromPath(pathname) {
         // 路径格式: /proxy/经过编码的URL
         // 例如: /proxy/https%3A%2F%2Fexample.com%2Fplaylist.m3u8
-        const encodedUrl = pathname.replace(/^\/proxy\//, '');
-        if (!encodedUrl) return null;
+        const encodedUrl = pathname.slice('/proxy/'.length);
+        if (!pathname.startsWith('/proxy/') || !encodedUrl) return null;
         try {
-            // 解码
-            let decodedUrl = decodeURIComponent(encodedUrl);
-
-             // 简单检查解码后是否是有效的 http/https URL
-             if (!decodedUrl.match(/^https?:\/\//i)) {
-                 // 也许原始路径就没有编码？如果看起来像URL就直接用
-                 if (encodedUrl.match(/^https?:\/\//i)) {
-                     decodedUrl = encodedUrl;
-                     logDebug(`Warning: Path was not encoded but looks like URL: ${decodedUrl}`);
-                 } else {
-                    logDebug(`无效的目标URL格式 (解码后): ${decodedUrl}`);
-                    return null;
-                 }
-             }
-             return decodedUrl;
-
+            return decodeURIComponent(encodedUrl);
         } catch (e) {
-            logDebug(`解码目标URL时出错: ${encodedUrl} - ${e.message}`);
             return null;
         }
+    }
+
+    function classifyTarget(target) {
+        if (target.protocol !== 'https:' || target.username || target.password || target.port) return null;
+        const hostname = target.hostname.toLowerCase().replace(/\.$/, '');
+        if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') ||
+            hostname.includes(':') || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return null;
+
+        if (PROVIDER_API_HOSTS.has(hostname) && target.pathname === '/api.php/provide/vod') {
+            const params = target.searchParams;
+            const keys = [...params.keys()];
+            if (keys.some(key => !['ac', 'wd', 'pg', 'ids'].includes(key)) ||
+                keys.some(key => params.getAll(key).length !== 1) || params.get('ac') !== 'videolist') return null;
+            const ids = params.get('ids');
+            if (ids !== null) {
+                return keys.length === 2 && /^[\w-]{1,128}$/.test(ids) ? 'provider-detail' : null;
+            }
+            const query = params.get('wd');
+            const page = params.get('pg');
+            if (!query || query.length > 100 ||
+                (page !== null && (!/^[1-9]\d?$/.test(page) || Number(page) > 50))) return null;
+            return 'provider-search';
+        }
+
+        if (hostname === 'movie.douban.com' && target.pathname === '/j/search_tags') {
+            const params = target.searchParams;
+            return params.size === 1 && ['movie', 'tv'].includes(params.get('type')) ? 'douban-tags' : null;
+        }
+        if (hostname === 'movie.douban.com' && target.pathname === '/j/search_subjects') {
+            const params = target.searchParams;
+            const allowedKeys = new Set(['type', 'tag', 'sort', 'page_limit', 'page_start']);
+            if ([...params.keys()].some(key => !allowedKeys.has(key)) ||
+                [...params.keys()].some(key => params.getAll(key).length !== 1) ||
+                !['movie', 'tv'].includes(params.get('type')) || !params.get('tag') ||
+                params.get('tag').length > 40 || !params.get('sort') ||
+                !/^[1-9]\d?$/.test(params.get('page_limit') || '') ||
+                Number(params.get('page_limit')) > 100 ||
+                !/^\d{1,5}$/.test(params.get('page_start') || '') ||
+                Number(params.get('page_start')) > 10000) return null;
+            return 'douban-subjects';
+        }
+
+        if (!target.search && !target.hash && DOUBAN_IMAGE_HOST.test(hostname) &&
+            /^\/view\/photo\/[a-z0-9_-]+\/public\/p\d+\.(?:jpe?g|png|webp)$/i.test(target.pathname)) {
+            return 'douban-image';
+        }
+        return null;
+    }
+
+    function isAllowedRedirect(target, originalTarget, purpose) {
+        const redirectPurpose = classifyTarget(target);
+        if (!redirectPurpose || redirectPurpose !== purpose) return false;
+        if (purpose !== 'douban-image' && target.hostname.toLowerCase() !== originalTarget.hostname.toLowerCase()) return false;
+        return true;
     }
 
     // 创建标准化的响应
     function createResponse(body, status = 200, headers = {}) {
         const responseHeaders = new Headers(headers);
-        // 关键：添加 CORS 跨域头，允许前端 JS 访问代理后的响应
-        responseHeaders.set("Access-Control-Allow-Origin", "*"); // 允许任何来源访问
-        responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS"); // 允许的方法
-        responseHeaders.set("Access-Control-Allow-Headers", "*"); // 允许所有请求头
-
-        // 处理 CORS 预检请求 (OPTIONS) - 放在这里确保所有响应都处理
-         if (request.method === "OPTIONS") {
-             // 使用下面的 onOptions 函数可以更规范，但在这里处理也可以
-             return new Response(null, {
-                 status: 204, // No Content
-                 headers: responseHeaders // 包含上面设置的 CORS 头
-             });
-         }
+        // Keep the proxy same-origin; the application does not need CORS access.
+        responseHeaders.delete("Access-Control-Allow-Origin");
+        responseHeaders.delete("Access-Control-Allow-Methods");
+        responseHeaders.delete("Access-Control-Allow-Headers");
 
         return new Response(body, { status, headers: responseHeaders });
     }
@@ -248,6 +217,13 @@ export async function onRequest(context) {
 
     // 获取远程内容及其类型
     async function fetchContentWithType(targetUrl) {
+        const originalTarget = new URL(targetUrl);
+        const purpose = classifyTarget(originalTarget);
+        if (!purpose) {
+            const error = new Error('Target is not allowed');
+            error.status = 403;
+            throw error;
+        }
         const headers = new Headers({
             'User-Agent': getRandomUserAgent(),
             'Accept': '*/*',
@@ -258,10 +234,23 @@ export async function onRequest(context) {
         });
 
         try {
-            // 直接请求目标 URL
-            logDebug(`开始直接请求: ${targetUrl}`);
-            // Cloudflare Functions 的 fetch 默认支持重定向
-            const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+            let currentTarget = originalTarget;
+            let response;
+            for (let redirects = 0; redirects <= 5; redirects++) {
+                response = await fetch(currentTarget.toString(), { headers, redirect: 'manual' });
+                if (![301, 302, 303, 307, 308].includes(response.status)) break;
+                const location = response.headers.get('Location');
+                if (!location || redirects === 5) break;
+                const nextTarget = new URL(location, currentTarget);
+                if (!isAllowedRedirect(nextTarget, originalTarget, purpose)) {
+                    await response.body?.cancel();
+                    const error = new Error('Redirect target is not allowed');
+                    error.status = 403;
+                    throw error;
+                }
+                await response.body?.cancel();
+                currentTarget = nextTarget;
+            }
 
             if (!response.ok) {
                  const errorBody = await response.text().catch(() => '');
@@ -270,9 +259,10 @@ export async function onRequest(context) {
             }
 
             // 读取响应内容为文本
+            const finalUrl = currentTarget.toString();
             const contentType = response.headers.get('Content-Type') || '';
-            if (!isTextResponse(targetUrl, contentType)) {
-                logDebug(`Request succeeded: ${targetUrl}, Content-Type: ${contentType}, forwarding binary stream`);
+            if (!isTextResponse(finalUrl, contentType)) {
+                logDebug(`Request succeeded: ${finalUrl}, Content-Type: ${contentType}, forwarding binary stream`);
                 return { content: null, body: response.body, contentType, responseHeaders: response.headers, status: response.status };
             }
 
@@ -283,7 +273,9 @@ export async function onRequest(context) {
         } catch (error) {
              logDebug(`请求彻底失败: ${targetUrl}: ${error.message}`);
             // 抛出更详细的错误
-            throw new Error(`请求目标URL失败 ${targetUrl}: ${error.message}`);
+            const wrappedError = new Error(`请求目标URL失败 ${targetUrl}: ${error.message}`);
+            wrappedError.status = error.status;
+            throw wrappedError;
         }
     }
 
@@ -525,6 +517,16 @@ export async function onRequest(context) {
             return createResponse("无效的代理请求。路径应为 /proxy/<经过编码的URL>", 400);
         }
 
+        let parsedTarget;
+        try {
+            parsedTarget = new URL(targetUrl);
+        } catch (error) {
+            return createResponse('Target URL is not allowed', 403);
+        }
+        if (!classifyTarget(parsedTarget)) {
+            return createResponse('Target URL is not allowed', 403);
+        }
+
         logDebug(`收到代理请求: ${targetUrl}`);
 
         // --- 缓存检查 (KV) ---
@@ -601,29 +603,25 @@ export async function onRequest(context) {
             logDebug(`内容不是 M3U8 (类型: ${contentType})，直接返回: ${targetUrl}`);
             const finalHeaders = new Headers(responseHeaders);
             finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
-            // 添加 CORS 头，确保非 M3U8 内容也能跨域访问（例如图片、字幕文件等）
-            finalHeaders.set("Access-Control-Allow-Origin", "*");
-            finalHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-            finalHeaders.set("Access-Control-Allow-Headers", "*");
+            finalHeaders.delete("Access-Control-Allow-Origin");
+            finalHeaders.delete("Access-Control-Allow-Methods");
+            finalHeaders.delete("Access-Control-Allow-Headers");
             return createResponse(content, 200, finalHeaders);
         }
 
     } catch (error) {
         logDebug(`处理代理请求时发生严重错误: ${error.message} \n ${error.stack}`);
-        return createResponse(`代理处理错误: ${error.message}`, 500);
+        return createResponse(`代理处理错误: ${error.message}`, error.status || 500);
     }
 }
 
 // 处理 OPTIONS 预检请求的函数
 export async function onOptions(context) {
     // 直接返回允许跨域的头信息
-    return new Response(null, {
-        status: 204, // No Content
+    return new Response('Method Not Allowed', {
+        status: 405,
         headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*", // 允许所有请求头
-            "Access-Control-Max-Age": "86400", // 预检请求结果缓存一天
+            "Allow": "GET",
         },
     });
 }
